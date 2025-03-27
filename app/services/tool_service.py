@@ -1,7 +1,11 @@
 import json
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+import requests
+import warnings
+from urllib3.exceptions import NotOpenSSLWarning
 
+warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
 
 class IntentClassifierTool:
     """Tool to determine the user's intent based on their message"""
@@ -62,8 +66,10 @@ class EmailTool:
         self.client = openai_client
 
     def generate_email(self, pharmacy_info: Dict[str, Any], user_query: str,
-                       topics_of_interest: List[str]) -> Dict[str, str]:
+                       topics_of_interest: List[str] = None) -> Dict[str, str]:
         """Generate an email based on pharmacy information and their interests"""
+        if topics_of_interest is None:
+            topics_of_interest = []
 
         service_offerings = {
             "inventory": "Our inventory management system helps reduce waste and ensures you never run out of critical medications.",
@@ -72,8 +78,15 @@ class EmailTool:
             "analytics": "Our analytics dashboard gives you insights into prescription trends, patient demographics, and business performance."
         }
 
+        if not topics_of_interest:
+            topics_of_interest = ["general"]
+
         relevant_offerings = []
         for topic in topics_of_interest:
+            if topic.lower() == "general":
+                relevant_offerings = list(service_offerings.values())
+                break
+
             for key, description in service_offerings.items():
                 if topic.lower() in key or key in topic.lower():
                     relevant_offerings.append(description)
@@ -130,10 +143,12 @@ class EmailTool:
             email = {
                 "to": pharmacy_info.get("email", "customer@example.com"),
                 "subject": "Information About Our Pharmacy Services",
-                "body": email_body
+                "body": email_body,
+                "topics": topics_of_interest
             }
 
             print(f"[MOCK] Email generated and ready to send to {email['to']}")
+            print(f"[MOCK] Email preview: {email_body[:100]}...")
 
             return email
 
@@ -142,7 +157,8 @@ class EmailTool:
             return {
                 "to": pharmacy_info.get("email", "customer@example.com"),
                 "subject": "Information About Our Pharmacy Services",
-                "body": f"{greeting}\n\nThank you for your interest in our pharmacy services. We specialize in helping pharmacies like yours improve efficiency and reduce costs.\n\nI'd be happy to schedule a call to discuss how we can help your pharmacy specifically.\n\nBest regards,\nThe Sales Team"
+                "body": f"{greeting}\n\nThank you for your interest in our pharmacy services. We specialize in helping pharmacies like yours improve efficiency and reduce costs.\n\nI'd be happy to schedule a call to discuss how we can help your pharmacy specifically.\n\nBest regards,\nThe Sales Team",
+                "topics": topics_of_interest
             }
 
     def send_email(self, email_data: Dict[str, str]) -> Dict[str, Any]:
@@ -156,3 +172,56 @@ class EmailTool:
             "message": f"Email sent successfully to {email_data['to']}",
             "timestamp": datetime.now().isoformat()
         }
+
+class PharmacyAPITool:
+    """Tool to interact with pharmacy data"""
+    def __init__(self, base_url: str = "https://67e14fb758cc6bf785254550.mockapi.io/pharmacies"):
+        self.base_url = base_url
+        self.session = requests.Session()
+    
+    def get_all_pharmacies(self) -> List[Dict[str, Any]]:
+        """Fetch all pharmacies from the API"""
+        try:
+            response = self.session.get(self.base_url)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"Error fetching pharmacies: {e}")
+            return []
+    
+    def get_pharmacy_by_phone(self, phone_number: str) -> Optional[Dict[str, Any]]:
+        """Look up a pharmacy by phone number"""
+        try:
+            response = self.session.get(f"{self.base_url}?phone={phone_number}")
+            response.raise_for_status()
+            
+            try:
+                result = response.json()
+                if isinstance(result, str) and result == "Not found":
+                    all_pharmacies = self.get_all_pharmacies()
+                    for pharmacy in all_pharmacies:
+                        if self._normalize_phone(pharmacy.get("phone", "")) == self._normalize_phone(phone_number):
+                            return pharmacy
+                    return None
+                
+                if isinstance(result, list) and result:
+                    return result[0]
+                
+            except requests.JSONDecodeError:
+                print("Invalid JSON response from API")
+                return None
+            
+            all_pharmacies = self.get_all_pharmacies()
+            for pharmacy in all_pharmacies:
+                if self._normalize_phone(pharmacy.get("phone", "")) == self._normalize_phone(phone_number):
+                    return pharmacy
+            
+            return None
+            
+        except requests.RequestException as e:
+            print(f"Error fetching pharmacy by phone: {e}")
+            return None
+
+    def _normalize_phone(self, phone: str) -> str:
+        """Normalize phone number for comparison"""
+        return ''.join(filter(str.isdigit, phone))

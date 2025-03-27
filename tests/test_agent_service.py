@@ -1,12 +1,12 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from app.services.agent_service import PharmacyAgent
-from app.services.tool_service import IntentClassifierTool, EmailTool
-from app.services.integration import PharmacyAPI
+from app.services.agent_service import ReActAgent, Thought, Observation
+from app.services.tool_service import IntentClassifierTool, EmailTool, PharmacyAPITool
+import json
 
 @pytest.fixture
 def mock_pharmacy_api():
-    mock_api = MagicMock(spec=PharmacyAPI)
+    mock_api = MagicMock(spec=PharmacyAPITool)
     mock_api.get_pharmacy_by_phone.return_value = {
         "phone": "1-555-123-4567",
         "name": "HealthFirst Pharmacy",
@@ -29,16 +29,18 @@ def mock_openai_client():
     def mock_create(*args, **kwargs):
         messages = kwargs.get('messages', [])
         system_prompt = next((msg['content'] for msg in messages if msg['role'] == 'system'), '')
-
-        if 'healthfirst pharmacy' in system_prompt.lower():
-            mock_response.choices[0].message.content = (
-                "Hello HealthFirst Pharmacy! I see you're in New York and handle prescriptions for "
-                "Lisinopril and Atorvastatin. I'd be happy to tell you about our pharmacy services. "
-                "We offer prescription processing automation, inventory management, compliance tracking, "
-                "and patient communication tools. These services can help reduce processing time by 30% "
-                "and save 15-20% in costs."
-            )
-        else:
+        
+        if "think through what needs to be done next" in system_prompt.lower():
+            mock_response.choices[0].message.content = json.dumps({
+                "reasoning": "User is asking about services, need to classify intent first",
+                "next_action": "classify user intent",
+                "tool_name": "classify_intent",
+                "tool_args": {
+                    "user_message": "What services do you offer?",
+                    "conversation_context": {"conversation_length": 1}
+                }
+            })
+        elif "generate a natural response" in system_prompt.lower():
             mock_response.choices[0].message.content = (
                 "That's a great question! Improving operations is crucial for any pharmacy. "
                 "We offer several services that can significantly enhance efficiency and "
@@ -79,7 +81,8 @@ def mock_email_tool():
     mock_tool.generate_email.return_value = {
         "to": "test@example.com",
         "subject": "Information About Our Pharmacy Services",
-        "body": "Thank you for your interest in our services..."
+        "body": "Thank you for your interest in our services...",
+        "topics": ["automation", "inventory"]
     }
     mock_tool.send_email.return_value = {"success": True, "message": "Email sent successfully"}
     return mock_tool
@@ -89,8 +92,8 @@ def agent(mock_openai_client, mock_intent_classifier, mock_email_tool, mock_phar
     with patch('app.services.agent_service.OpenAI', return_value=mock_openai_client), \
          patch('app.services.agent_service.IntentClassifierTool', return_value=mock_intent_classifier), \
          patch('app.services.agent_service.EmailTool', return_value=mock_email_tool), \
-         patch('app.services.agent_service.PharmacyAPI', return_value=mock_pharmacy_api):
-        agent = PharmacyAgent()
+         patch('app.services.agent_service.PharmacyAPITool', return_value=mock_pharmacy_api):
+        agent = ReActAgent()
         return agent
 
 def test_handle_service_inquiry(agent):
@@ -163,4 +166,82 @@ def test_handle_service_inquiry_with_unknown_pharmacy(agent, mock_pharmacy_api, 
     
     response4 = agent.process_message("We process about 1000 prescriptions monthly")
     assert "1000" in response4
-    assert "email" in response4.lower() 
+    assert "email" in response4.lower()
+
+def test_react_loop(agent, mock_openai_client):
+    """Test that the ReAct loop works correctly"""
+    # Mock the thought generation to simulate a complete ReAct cycle
+    mock_openai_client.chat.completions.create.side_effect = [
+        # First thought: classify intent
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "reasoning": "Need to classify user intent",
+            "next_action": "classify intent",
+            "tool_name": "classify_intent",
+            "tool_args": {
+                "user_message": "test message",
+                "conversation_context": {"conversation_length": 1}
+            }
+        })))]),
+        # Second thought: generate email
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "reasoning": "User requested email",
+            "next_action": "generate email",
+            "tool_name": "generate_email",
+            "tool_args": {
+                "pharmacy_info": {"name": "Test Pharmacy"},
+                "user_query": "test message",
+                "topics_of_interest": ["automation"]
+            }
+        })))]),
+        # Final response
+        MagicMock(choices=[MagicMock(message=MagicMock(content="Email sent successfully"))])
+    ]
+
+    response = agent.process_message("Can you send me more information?")
+    assert "email" in response.lower()
+    assert "sent" in response.lower()
+
+def test_tool_execution(agent):
+    """Test that tools are executed correctly"""
+    thought = Thought(
+        reasoning="Test tool execution",
+        next_action="calculate rx volume",
+        tool_name="calculate_rx_volume",
+        tool_args={"pharmacy": {"prescriptions": [{"count": 10}, {"count": 20}]}}
+    )
+    
+    observation = agent._execute_tool(thought)
+    assert observation.success
+    assert observation.result == 30
+
+def test_tool_execution_with_missing_context(agent):
+    """Test that tool execution fails when required context is missing"""
+    thought = Thought(
+        reasoning="Test missing context",
+        next_action="generate email",
+        tool_name="generate_email",
+        tool_args={"pharmacy_info": {"name": "Test"}}  # Missing required context
+    )
+    
+    observation = agent._execute_tool(thought)
+    assert not observation.success
+    assert "Missing required context" in observation.error
+
+def test_state_update(agent):
+    """Test that agent state is updated correctly"""
+    thought = Thought(
+        reasoning="Test state update",
+        next_action="find pharmacy",
+        tool_name="find_pharmacy",
+        tool_args={"phone_number": "1-555-123-4567"}
+    )
+    
+    observation = Observation(
+        result={"name": "Test Pharmacy", "city": "Test City"},
+        success=True
+    )
+    
+    agent._update_state(thought, observation)
+    assert agent.current_pharmacy == observation.result
+    assert len(agent.conversation_history) > 0
+    assert "Thought: Test state update" in agent.conversation_history[-1]["content"] 
